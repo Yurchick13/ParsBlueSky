@@ -5,6 +5,7 @@ BlueSky Parser - load posts from BlueSky into Neo4j graph DB
 Graph structure:
     (BlueSky_Account)-[:POSTED]->(BlueSky_Post)
     (BlueSky_Account)-[:FOLLOWS]->(BlueSky_Account)
+    (BlueSky_Account)-[:COMMENTED]->(BlueSky_Post)
     (BlueSky_Post)-[:MENTIONS]->(BlueSky_Account)
     (BlueSky_Post)-[:TAGS]->(Hashtag)
     (BlueSky_Post)-[:REBLOG_OF]->(BlueSky_Post)
@@ -22,6 +23,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Set, Tuple
 from urllib.parse import urlparse
@@ -46,11 +48,11 @@ class Config:
 
     #ВВЕСТИ СВОИ ДАННЫЕ!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     NEO4J_USER: str = os.getenv("NEO4J_USER", "neo4j")
-    NEO4J_PASSWORD: str = os.getenv("NEO4J_PASSWORD", "********")
+    NEO4J_PASSWORD: str = os.getenv("NEO4J_PASSWORD", ""**************************************")")
 
     # BlueSky ВВЕСТИ СВОИ ДАННЫЕ!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    BLUESKY_IDENTIFIER: str = os.getenv("BLUESKY_IDENTIFIER", "********")
-    BLUESKY_PASSWORD: str = os.getenv("BLUESKY_PASSWORD", "********")
+    BLUESKY_IDENTIFIER: str = os.getenv("BLUESKY_IDENTIFIER", "**************************************")
+    BLUESKY_PASSWORD: str = os.getenv("BLUESKY_PASSWORD", ""**************************************")")
 
     # Loading limits
     MAX_PAGES: int = 0  # 0 = unlimited
@@ -60,7 +62,10 @@ class Config:
     # Accounts to parse
     ACCOUNTS: List[str] = None
     PRIOR: int = 1
+    SYNC_ACCOUNT_COUNTERS: bool = True
     SYNC_SOCIAL_GRAPH: bool = False
+    SYNC_POST_COMMENTERS: bool = True
+    COMMENT_THREAD_DEPTH: int = 16
 
     # Logging
     LOG_LEVEL: int = logging.INFO
@@ -183,8 +188,16 @@ class Neo4jManager:
                 result = session.run(f"MATCH (n:{label}) RETURN count(n) as count")
                 record = result.single()
                 stats[label] = record["count"] if record else 0
-            rel = session.run("MATCH ()-[r:FOLLOWS]->() RETURN count(r) as count").single()
+            rel = session.run(
+                "MATCH ()-[r]->() WHERE type(r) = $rel_type RETURN count(r) as count",
+                {"rel_type": "FOLLOWS"},
+            ).single()
             stats["FOLLOWS"] = rel["count"] if rel else 0
+            rel = session.run(
+                "MATCH ()-[r]->() WHERE type(r) = $rel_type RETURN count(r) as count",
+                {"rel_type": "COMMENTED"},
+            ).single()
+            stats["COMMENTED"] = rel["count"] if rel else 0
         return stats
 
     def get_accounts_with_prior(self, prior: int = 1) -> List[Dict]:
@@ -237,11 +250,24 @@ class BlueskyClient:
         return value
 
     @staticmethod
+    def _to_snake_case(key: str) -> str:
+        if not isinstance(key, str) or not key or key.startswith("$"):
+            return key
+        converted = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", key)
+        converted = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", converted)
+        return converted.lower()
+
+    @staticmethod
     def _normalize_value(obj: Any) -> Any:
         if obj is None:
             return None
         if isinstance(obj, dict):
-            return {key: BlueskyClient._normalize_value(value) for key, value in obj.items()}
+            normalized = {key: BlueskyClient._normalize_value(value) for key, value in obj.items()}
+            for key, value in list(normalized.items()):
+                alias = BlueskyClient._to_snake_case(key)
+                if alias != key and alias not in normalized:
+                    normalized[alias] = value
+            return normalized
         if isinstance(obj, list):
             return [BlueskyClient._normalize_value(item) for item in obj]
         if hasattr(obj, "model_dump"):
@@ -280,6 +306,17 @@ class BlueskyClient:
         except Exception as exc:
             raise Exception(f"Failed to fetch feed for {actor}: {exc}") from exc
 
+    def get_post_thread(self, uri: str, depth: int = 16) -> Dict[str, Any]:
+        try:
+            clean_uri = uri.strip()
+            try:
+                response = self.client.get_post_thread(uri=clean_uri, depth=depth, parent_height=0)
+            except TypeError:
+                response = self.client.get_post_thread(uri=clean_uri, depth=depth)
+            return self._to_dict(response)
+        except Exception:
+            return {}
+
     def get_social_graph(self, actor: str, limit: int = 100) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         clean_actor = self.normalize_actor(actor)
         follows = self._paginate_people(clean_actor, "get_follows", "follows", limit=limit)
@@ -310,7 +347,7 @@ class BlueskyClient:
                     {
                         "did": did,
                         "handle": p.get("handle", ""),
-                        "display_name": p.get("display_name", ""),
+                        "display_name": p.get("display_name", p.get("displayName", "")),
                     }
                 )
             cursor = response.get("cursor")
@@ -397,6 +434,22 @@ class GraphLoader:
         self.log = logger
         self._embed_debug_count = 0
 
+    @staticmethod
+    def _pick_first(data: Dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            if key in data and data[key] is not None:
+                return data[key]
+        return None
+
+    @staticmethod
+    def _to_int_or_none(value: Any) -> Optional[int]:
+        if value in (None, ""):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
     def _copy_parts_to_post(self, session, source_post_id: str, target_post_id: str):
         """Copy all :part relations from one post to another."""
         session.run(
@@ -413,6 +466,13 @@ class GraphLoader:
         created_at = account.get("created_at") or account.get("indexed_at")
         created_at = DataParser.parse_iso_datetime(created_at)
         created_at_iso = (created_at or datetime.datetime.utcnow()).isoformat()
+        display_name = DataParser.as_string(self._pick_first(account, "display_name", "displayName"))
+        description = DataParser.as_string(self._pick_first(account, "description", "desc"))
+        followers_count = self._to_int_or_none(self._pick_first(account, "followers_count", "followersCount"))
+        following_count = self._to_int_or_none(
+            self._pick_first(account, "following_count", "follows_count", "followsCount")
+        )
+        posts_count = self._to_int_or_none(self._pick_first(account, "posts_count", "postsCount"))
 
         query = """
         MERGE (a:BlueSky_Account {id: $id})
@@ -420,32 +480,39 @@ class GraphLoader:
             a.dateC = datetime(),
             a.handle = $handle,
             a.display_name = $display_name,
+            a.description = $description,
+            a.descr = $description,
             a.url = $url,
             a.created_at = datetime($created_at),
-            a.followers_count = $followers_count,
-            a.following_count = $following_count,
-            a.posts_count = $posts_count,
+            a.followers_count = coalesce($followers_count, 0),
+            a.following_count = coalesce($following_count, 0),
+            a.follows_count = coalesce($following_count, 0),
+            a.posts_count = coalesce($posts_count, 0),
             a.prior = $prior,
             a.last_post_uri = ''
         ON MATCH SET
-            a.handle = $handle,
-            a.display_name = $display_name,
-            a.url = $url,
-            a.followers_count = $followers_count,
-            a.following_count = $following_count,
-            a.posts_count = $posts_count,
+            a.handle = CASE WHEN $handle <> '' THEN $handle ELSE a.handle END,
+            a.display_name = CASE WHEN $display_name <> '' THEN $display_name ELSE a.display_name END,
+            a.description = CASE WHEN $description <> '' THEN $description ELSE a.description END,
+            a.descr = CASE WHEN $description <> '' THEN $description ELSE a.descr END,
+            a.url = CASE WHEN $url <> '' THEN $url ELSE a.url END,
+            a.followers_count = CASE WHEN $followers_count IS NOT NULL THEN $followers_count ELSE a.followers_count END,
+            a.following_count = CASE WHEN $following_count IS NOT NULL THEN $following_count ELSE a.following_count END,
+            a.follows_count = CASE WHEN $following_count IS NOT NULL THEN $following_count ELSE a.follows_count END,
+            a.posts_count = CASE WHEN $posts_count IS NOT NULL THEN $posts_count ELSE a.posts_count END,
             a.prior = $prior,
             a.dateM = datetime()
         """
         params = {
             "id": account.get("did"),
-            "handle": account.get("handle", ""),
-            "display_name": account.get("display_name", ""),
+            "handle": DataParser.as_string(account.get("handle")),
+            "display_name": display_name,
+            "description": description,
             "url": f"https://bsky.app/profile/{account.get('did')}",
             "created_at": created_at_iso,
-            "followers_count": int(account.get("followers_count") or account.get("followersCount") or 0),
-            "following_count": int(account.get("follows_count") or account.get("following_count") or 0),
-            "posts_count": int(account.get("posts_count") or 0),
+            "followers_count": followers_count,
+            "following_count": following_count,
+            "posts_count": posts_count,
             "prior": prior,
         }
         result = self.db.execute_write(query, params)
@@ -548,6 +615,155 @@ class GraphLoader:
                     {"src_id": did, "dst_id": account_did},
                 )
 
+            session.run(
+                """
+                MATCH (a:BlueSky_Account {id: $account_id})
+                SET
+                    a.following_count = $following_count,
+                    a.follows_count = $following_count,
+                    a.followers_count = $followers_count,
+                    a.dateM = datetime()
+                """,
+                {
+                    "account_id": account_did,
+                    "following_count": len(follows),
+                    "followers_count": len(followers),
+                },
+            )
+
+    def _extract_commenters_from_thread(
+        self,
+        thread_payload: Dict[str, Any],
+        root_post_id: str,
+    ) -> Tuple[Counter, Dict[str, Dict[str, str]], List[Dict[str, str]]]:
+        actor_counts: Counter = Counter()
+        actor_meta: Dict[str, Dict[str, str]] = {}
+        comments: List[Dict[str, str]] = []
+        seen_comment_posts: Set[str] = set()
+
+        stack: List[Any] = []
+        replies = thread_payload.get("replies", [])
+        if isinstance(replies, list):
+            stack.extend(replies)
+
+        while stack:
+            item = stack.pop()
+
+            if not isinstance(item, dict):
+                continue
+
+            post = item.get("post")
+            if isinstance(post, dict):
+                comment_post_id = DataParser.as_string(post.get("uri"))
+                author = post.get("author", {})
+                if not isinstance(author, dict):
+                    author = {}
+                did = DataParser.as_string(author.get("did"))
+                if did and comment_post_id and comment_post_id != root_post_id and comment_post_id not in seen_comment_posts:
+                    seen_comment_posts.add(comment_post_id)
+                    actor_counts[did] += 1
+                    handle = DataParser.as_string(author.get("handle"))
+                    display_name = DataParser.as_string(author.get("display_name") or author.get("displayName"))
+                    prev = actor_meta.get(did, {})
+                    actor_meta[did] = {
+                        "handle": handle or prev.get("handle", ""),
+                        "display_name": display_name or prev.get("display_name", ""),
+                    }
+                    comments.append(
+                        {
+                            "post_id": comment_post_id,
+                            "actor_id": did,
+                        }
+                    )
+
+            nested_replies = item.get("replies", [])
+            if isinstance(nested_replies, list):
+                stack.extend(nested_replies)
+
+        return actor_counts, actor_meta, comments
+
+    def save_post_commenters(self, root_post_id: str, thread_payload: Dict[str, Any]) -> Dict[str, int]:
+        if not root_post_id or not thread_payload:
+            return {"commenters": 0, "comments": 0}
+
+        thread = thread_payload.get("thread", thread_payload)
+        if not isinstance(thread, dict):
+            return {"commenters": 0, "comments": 0}
+
+        actor_counts, actor_meta, comments = self._extract_commenters_from_thread(thread, root_post_id)
+        if not comments:
+            return {"commenters": 0, "comments": 0}
+
+        with self.db.driver.session() as session:
+            session.run(
+                """
+                MERGE (p:BlueSky_Post {id: $post_id})
+                ON CREATE SET p.dateC = datetime()
+                """,
+                {"post_id": root_post_id},
+            )
+
+            for actor_id, comments_count in actor_counts.items():
+                meta = actor_meta.get(actor_id, {})
+                self._merge_account_meta(
+                    session,
+                    actor_id,
+                    meta.get("handle", ""),
+                    meta.get("display_name", ""),
+                )
+                session.run(
+                    """
+                    MATCH (a:BlueSky_Account {id: $actor_id})
+                    MATCH (p:BlueSky_Post {id: $post_id})
+                    MERGE (a)-[r:COMMENTED]->(p)
+                    ON CREATE SET r.dateC = datetime()
+                    SET r.comments_count = $comments_count, r.dateM = datetime()
+                    """,
+                    {"actor_id": actor_id, "post_id": root_post_id, "comments_count": comments_count},
+                )
+
+            for comment in comments:
+                session.run(
+                    """
+                    MERGE (cp:BlueSky_Post {id: $comment_post_id})
+                    ON CREATE SET cp.dateC = datetime(), cp.synthetic = true
+                    SET cp.account_id = $actor_id, cp.dateM = datetime()
+                    WITH cp
+                    MATCH (p:BlueSky_Post {id: $post_id})
+                    MERGE (cp)-[:REPLY_TO]->(p)
+                    """,
+                    {
+                        "comment_post_id": comment["post_id"],
+                        "actor_id": comment["actor_id"],
+                        "post_id": root_post_id,
+                    },
+                )
+                session.run(
+                    """
+                    MATCH (a:BlueSky_Account {id: $actor_id})
+                    MATCH (cp:BlueSky_Post {id: $comment_post_id})
+                    MERGE (a)-[:POSTED]->(cp)
+                    """,
+                    {"actor_id": comment["actor_id"], "comment_post_id": comment["post_id"]},
+                )
+
+            session.run(
+                """
+                MATCH (p:BlueSky_Post {id: $post_id})
+                SET
+                    p.commenters_count = $commenters_count,
+                    p.comments_loaded = $comments_loaded,
+                    p.dateM = datetime()
+                """,
+                {
+                    "post_id": root_post_id,
+                    "commenters_count": len(actor_counts),
+                    "comments_loaded": len(comments),
+                },
+            )
+
+        return {"commenters": len(actor_counts), "comments": len(comments)}
+
     def _extract_post_identity(self, post: Dict[str, Any]) -> Dict[str, Any]:
         author = post.get("author", {})
         record = post.get("record", {})
@@ -563,7 +779,7 @@ class GraphLoader:
             "cid": post.get("cid"),
             "author_id": author.get("did"),
             "author_handle": author.get("handle", ""),
-            "author_display_name": author.get("display_name", ""),
+            "author_display_name": author.get("display_name", author.get("displayName", "")),
             "created_at": record.get("created_at") or post.get("indexed_at"),
             "indexed_at": post.get("indexed_at"),
             "text": text,
@@ -605,8 +821,9 @@ class GraphLoader:
                 a.url = $url,
                 a.last_post_uri = ''
             ON MATCH SET
-                a.handle = coalesce(a.handle, $handle),
-                a.display_name = coalesce(a.display_name, $display_name),
+                a.handle = CASE WHEN $handle <> '' THEN $handle ELSE a.handle END,
+                a.display_name = CASE WHEN $display_name <> '' THEN $display_name ELSE a.display_name END,
+                a.url = CASE WHEN $url <> '' THEN $url ELSE a.url END,
                 a.dateM = datetime()
             """
             session.run(
@@ -628,10 +845,14 @@ class GraphLoader:
                 p.created_at = datetime($created_at),
                 p.indexed_at = datetime($indexed_at),
                 p.reply_count = $reply_count,
+                p.comments_count = $reply_count,
                 p.repost_count = $repost_count,
+                p.reposts_count = $repost_count,
                 p.like_count = $like_count,
+                p.likes_count = $like_count,
                 p.quote_count = $quote_count,
                 p.view_count = $view_count,
+                p.views_count = $view_count,
                 p.text = $text,
                 p.dateM = datetime()
             """
@@ -926,7 +1147,8 @@ class BlueskyParser:
                 self.log.error(f"Account not found: {actor}")
                 continue
 
-            self.log.success(f"Found: {account.get('display_name', '')} (@{account.get('handle', '')})")
+            display_name = account.get("display_name") or account.get("displayName") or ""
+            self.log.success(f"Found: {display_name} (@{account.get('handle', '')})")
             if account.get("did"):
                 resolved_ids.append(account["did"])
             is_created = self.loader.add_account(account, prior)
@@ -1002,7 +1224,27 @@ class BlueskyParser:
                 if not post_uri:
                     continue
 
+                if first_post_uri is None:
+                    first_post_uri = post_uri
+                    self.log.info(f"First post uri: {first_post_uri}")
+
                 if last_post_uri and post_uri == last_post_uri:
+                    self.loader.save_post(post, reason=item.get("reason"))
+                    self.log.info(f"Refreshed metrics for checkpoint post {post_uri}")
+
+                    if self.config.SYNC_POST_COMMENTERS:
+                        try:
+                            thread = self.bluesky.get_post_thread(post_uri, depth=self.config.COMMENT_THREAD_DEPTH)
+                            if thread:
+                                comment_stats = self.loader.save_post_commenters(post_uri, thread)
+                                if comment_stats["comments"] > 0:
+                                    self.log.data(
+                                        f"Comments synced for checkpoint post: commenters={comment_stats['commenters']}, "
+                                        f"comments={comment_stats['comments']}"
+                                    )
+                        except Exception as exc:
+                            self.log.warning(f"Failed to sync commenters for checkpoint post {post_uri}: {exc}")
+
                     stop_reason = f"reached last_post_uri={last_post_uri}"
                     self.log.success(stop_reason)
                     should_break = True
@@ -1016,10 +1258,6 @@ class BlueskyParser:
                     should_break = True
                     break
 
-                if first_post_uri is None:
-                    first_post_uri = post_uri
-                    self.log.info(f"First post uri: {first_post_uri}")
-
                 is_new = self.loader.save_post(post, reason=item.get("reason"))
                 loaded_count += 1
 
@@ -1027,6 +1265,19 @@ class BlueskyParser:
                     self.log.data(f"Loaded posts: {loaded_count} (new)")
                 else:
                     self.log.info(f"Loaded posts: {loaded_count} (updated)")
+
+                if self.config.SYNC_POST_COMMENTERS:
+                    try:
+                        thread = self.bluesky.get_post_thread(post_uri, depth=self.config.COMMENT_THREAD_DEPTH)
+                        if thread:
+                            comment_stats = self.loader.save_post_commenters(post_uri, thread)
+                            if comment_stats["comments"] > 0:
+                                self.log.data(
+                                    f"Comments synced for post: commenters={comment_stats['commenters']}, "
+                                    f"comments={comment_stats['comments']}"
+                                )
+                    except Exception as exc:
+                        self.log.warning(f"Failed to sync commenters for post {post_uri}: {exc}")
 
                 if self.config.MAX_POSTS > 0 and loaded_count >= self.config.MAX_POSTS:
                     stop_reason = f"post limit reached ({self.config.MAX_POSTS})"
@@ -1056,14 +1307,24 @@ class BlueskyParser:
 
         return loaded_count
 
-    def sync_social_graph_for_account(self, account_id: str):
-        self.log.process(f"Sync followers/follows for {account_id}...")
+    def sync_account_counters_for_account(self, account_id: str):
+        self.log.process(f"Sync counters for {account_id}...")
         account = self.bluesky.get_account(account_id)
-        if account:
-            self.loader.add_account(account, self.config.PRIOR)
+        if not account:
+            self.log.warning(f"Failed to fetch account counters for {account_id}")
+            return
+
+        self.loader.add_account(account, self.config.PRIOR)
+        followers = account.get("followers_count", account.get("followersCount", 0))
+        following = account.get("following_count", account.get("follows_count", account.get("followsCount", 0)))
+        posts = account.get("posts_count", account.get("postsCount", 0))
+        self.log.data(f"Counters for {account_id}: followers={followers}, following={following}, posts={posts}")
+
+    def sync_social_graph_for_account(self, account_id: str):
+        self.log.process(f"Sync followers/follows relations for {account_id}...")
         follows, followers = self.bluesky.get_social_graph(account_id)
         self.loader.save_social_graph(account_id, follows, followers)
-        self.log.data(f"Social graph for {account_id}: follows={len(follows)}, followers={len(followers)}")
+        self.log.data(f"Social graph relations for {account_id}: follows={len(follows)}, followers={len(followers)}")
 
     def run(self):
         self.log.separator("#")
@@ -1079,7 +1340,11 @@ class BlueskyParser:
         self.log.info(">>> Step 2: Load posts")
         self.log.info(
             f"Settings: max_pages={self.config.MAX_PAGES}, max_posts={self.config.MAX_POSTS}, "
-            f"min_date={self.config.MIN_DATE}, prior={self.config.PRIOR}"
+            f"min_date={self.config.MIN_DATE}, prior={self.config.PRIOR}, "
+            f"sync_account_counters={self.config.SYNC_ACCOUNT_COUNTERS}, "
+            f"sync_social_graph={self.config.SYNC_SOCIAL_GRAPH}, "
+            f"sync_post_commenters={self.config.SYNC_POST_COMMENTERS}, "
+            f"comment_thread_depth={self.config.COMMENT_THREAD_DEPTH}"
         )
 
         if self.run_account_ids:
@@ -1090,13 +1355,21 @@ class BlueskyParser:
             self.log.data(f"Accounts found by prior={self.config.PRIOR}: {len(accounts)}")
         total_accounts = len(accounts)
 
+        if self.config.SYNC_ACCOUNT_COUNTERS:
+            self.log.info(">>> Step 2.1: Sync account counters")
+            for account in accounts:
+                try:
+                    self.sync_account_counters_for_account(account["id"])
+                except Exception as exc:
+                    self.log.warning(f"Failed to sync account counters for {account['id']}: {exc}")
+
         if self.config.SYNC_SOCIAL_GRAPH:
-            self.log.info(">>> Step 2.1: Sync followers/follows")
+            self.log.info(">>> Step 2.2: Sync followers/follows relations")
             for account in accounts:
                 try:
                     self.sync_social_graph_for_account(account["id"])
                 except Exception as exc:
-                    self.log.warning(f"Failed to sync social graph for {account['id']}: {exc}")
+                    self.log.warning(f"Failed to sync social graph relations for {account['id']}: {exc}")
 
         total_loaded = 0
         for idx, account in enumerate(accounts, 1):
@@ -1169,7 +1442,10 @@ if __name__ == "__main__":
     MAX_POSTS = 0
     MIN_DATE = None
     PRIOR = 1
+    SYNC_ACCOUNT_COUNTERS = True
     SYNC_SOCIAL_GRAPH = False
+    SYNC_POST_COMMENTERS = True
+    COMMENT_THREAD_DEPTH = 16
 
     # Example:
     # MIN_DATE = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
@@ -1193,7 +1469,10 @@ if __name__ == "__main__":
         MAX_POSTS=MAX_POSTS,
         MIN_DATE=MIN_DATE,
         PRIOR=PRIOR,
+        SYNC_ACCOUNT_COUNTERS=SYNC_ACCOUNT_COUNTERS,
         SYNC_SOCIAL_GRAPH=SYNC_SOCIAL_GRAPH,
+        SYNC_POST_COMMENTERS=SYNC_POST_COMMENTERS,
+        COMMENT_THREAD_DEPTH=COMMENT_THREAD_DEPTH,
     )
 
     parser = BlueskyParser(config)
