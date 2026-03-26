@@ -48,11 +48,11 @@ class Config:
 
     #ВВЕСТИ СВОИ ДАННЫЕ!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     NEO4J_USER: str = os.getenv("NEO4J_USER", "neo4j")
-    NEO4J_PASSWORD: str = os.getenv("NEO4J_PASSWORD", ""**************************************")")
+    NEO4J_PASSWORD: str = os.getenv("NEO4J_PASSWORD", ""*************************")")
 
     # BlueSky ВВЕСТИ СВОИ ДАННЫЕ!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    BLUESKY_IDENTIFIER: str = os.getenv("BLUESKY_IDENTIFIER", "**************************************")
-    BLUESKY_PASSWORD: str = os.getenv("BLUESKY_PASSWORD", ""**************************************")")
+    BLUESKY_IDENTIFIER: str = os.getenv("BLUESKY_IDENTIFIER", "*************************")
+    BLUESKY_PASSWORD: str = os.getenv("BLUESKY_PASSWORD", ""*************************")")
 
     # Loading limits
     MAX_PAGES: int = 0  # 0 = unlimited
@@ -322,6 +322,10 @@ class BlueskyClient:
         follows = self._paginate_people(clean_actor, "get_follows", "follows", limit=limit)
         followers = self._paginate_people(clean_actor, "get_followers", "followers", limit=limit)
         return follows, followers
+
+    def get_followers_graph(self, actor: str, limit: int = 100) -> List[Dict[str, Any]]:
+        clean_actor = self.normalize_actor(actor)
+        return self._paginate_people(clean_actor, "get_followers", "followers", limit=limit)
 
     def _paginate_people(
         self,
@@ -629,6 +633,37 @@ class GraphLoader:
                     "following_count": len(follows),
                     "followers_count": len(followers),
                 },
+            )
+
+    def save_followers_graph(self, account_did: str, followers: List[Dict[str, Any]]):
+        with self.db.driver.session() as session:
+            self._merge_account_stub(session, account_did)
+
+            for follower in followers:
+                did = follower.get("did")
+                if not did:
+                    continue
+                self._merge_account_meta(
+                    session,
+                    did,
+                    follower.get("handle", ""),
+                    follower.get("display_name", ""),
+                )
+                session.run(
+                    """
+                    MATCH (src:BlueSky_Account {id: $src_id})
+                    MATCH (dst:BlueSky_Account {id: $dst_id})
+                    MERGE (src)-[:FOLLOWS]->(dst)
+                    """,
+                    {"src_id": did, "dst_id": account_did},
+                )
+
+            session.run(
+                """
+                MATCH (a:BlueSky_Account {id: $account_id})
+                SET a.followers_count = $followers_count, a.dateM = datetime()
+                """,
+                {"account_id": account_did, "followers_count": len(followers)},
             )
 
     def _extract_commenters_from_thread(
@@ -1321,10 +1356,10 @@ class BlueskyParser:
         self.log.data(f"Counters for {account_id}: followers={followers}, following={following}, posts={posts}")
 
     def sync_social_graph_for_account(self, account_id: str):
-        self.log.process(f"Sync followers/follows relations for {account_id}...")
-        follows, followers = self.bluesky.get_social_graph(account_id)
-        self.loader.save_social_graph(account_id, follows, followers)
-        self.log.data(f"Social graph relations for {account_id}: follows={len(follows)}, followers={len(followers)}")
+        self.log.process(f"Sync followers relations for {account_id}...")
+        followers = self.bluesky.get_followers_graph(account_id)
+        self.loader.save_followers_graph(account_id, followers)
+        self.log.data(f"Followers relations for {account_id}: followers={len(followers)}")
 
     def run(self):
         self.log.separator("#")
@@ -1364,12 +1399,12 @@ class BlueskyParser:
                     self.log.warning(f"Failed to sync account counters for {account['id']}: {exc}")
 
         if self.config.SYNC_SOCIAL_GRAPH:
-            self.log.info(">>> Step 2.2: Sync followers/follows relations")
+            self.log.info(">>> Step 2.2: Sync followers relations")
             for account in accounts:
                 try:
                     self.sync_social_graph_for_account(account["id"])
                 except Exception as exc:
-                    self.log.warning(f"Failed to sync social graph relations for {account['id']}: {exc}")
+                    self.log.warning(f"Failed to sync followers relations for {account['id']}: {exc}")
 
         total_loaded = 0
         for idx, account in enumerate(accounts, 1):
@@ -1447,6 +1482,10 @@ if __name__ == "__main__":
     SYNC_POST_COMMENTERS = True
     COMMENT_THREAD_DEPTH = 16
 
+    
+    if 1: #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! ЗАМЕНИТЬ НА 0 и 1 ПРИ НЕОБХОДИМОСТИ, ГДЕ 0 - НЕТ, 1 - ДА!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        SYNC_SOCIAL_GRAPH = True
+
     # Example:
     # MIN_DATE = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
 
@@ -1480,5 +1519,3 @@ if __name__ == "__main__":
         parser.run()
     finally:
         parser.close()
-
-
