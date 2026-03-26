@@ -1,10 +1,10 @@
-
 """
 BlueSky Parser - load posts from BlueSky into Neo4j graph DB
 
 Graph structure:
     (BlueSky_Account)-[:POSTED]->(BlueSky_Post)
     (BlueSky_Account)-[:FOLLOWS]->(BlueSky_Account)
+    (BlueSky_Account)-[:FOLLOWING]->(BlueSky_Account)
     (BlueSky_Account)-[:COMMENTED]->(BlueSky_Post)
     (BlueSky_Post)-[:MENTIONS]->(BlueSky_Account)
     (BlueSky_Post)-[:TAGS]->(Hashtag)
@@ -46,24 +46,28 @@ class Config:
     # Neo4j
     NEO4J_URI: str = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 
-    #ВВЕСТИ СВОИ ДАННЫЕ!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # ВВЕСТИ СВОИ ДАННЫЕ!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     NEO4J_USER: str = os.getenv("NEO4J_USER", "neo4j")
-    NEO4J_PASSWORD: str = os.getenv("NEO4J_PASSWORD", ""*************************")")
+    NEO4J_PASSWORD: str = os.getenv("NEO4J_PASSWORD", "**************")
 
     # BlueSky ВВЕСТИ СВОИ ДАННЫЕ!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    BLUESKY_IDENTIFIER: str = os.getenv("BLUESKY_IDENTIFIER", "*************************")
-    BLUESKY_PASSWORD: str = os.getenv("BLUESKY_PASSWORD", ""*************************")")
+    BLUESKY_IDENTIFIER: str = os.getenv("BLUESKY_IDENTIFIER", "**************")
+    BLUESKY_PASSWORD: str = os.getenv("BLUESKY_PASSWORD", "**************")
 
     # Loading limits
     MAX_PAGES: int = 0  # 0 = unlimited
     MAX_POSTS: int = 0  # 0 = unlimited
     MIN_DATE: Optional[datetime.datetime] = None
+    MAX_FOLLOWERS: int = 0  # 0 = unlimited
+    MAX_FOLLOWS: int = 0  # 0 = unlimited
 
     # Accounts to parse
     ACCOUNTS: List[str] = None
     PRIOR: int = 1
     SYNC_ACCOUNT_COUNTERS: bool = True
     SYNC_SOCIAL_GRAPH: bool = False
+    SYNC_FOLLOWS_GRAPH: bool = False
+    ENRICH_SOCIAL_PROFILES: bool = True
     SYNC_POST_COMMENTERS: bool = True
     COMMENT_THREAD_DEPTH: int = 16
 
@@ -195,6 +199,11 @@ class Neo4jManager:
             stats["FOLLOWS"] = rel["count"] if rel else 0
             rel = session.run(
                 "MATCH ()-[r]->() WHERE type(r) = $rel_type RETURN count(r) as count",
+                {"rel_type": "FOLLOWING"},
+            ).single()
+            stats["FOLLOWING"] = rel["count"] if rel else 0
+            rel = session.run(
+                "MATCH ()-[r]->() WHERE type(r) = $rel_type RETURN count(r) as count",
                 {"rel_type": "COMMENTED"},
             ).single()
             stats["COMMENTED"] = rel["count"] if rel else 0
@@ -250,6 +259,29 @@ class BlueskyClient:
         return value
 
     @staticmethod
+    def _as_string(value: Any) -> str:
+        return value if isinstance(value, str) else ""
+
+    @staticmethod
+    def _normalize_account_id(value: Any) -> str:
+        text = BlueskyClient._as_string(value).strip()
+        if not text or text == "0" or text.isdigit():
+            return ""
+        return text
+
+    @staticmethod
+    def _pick_first(data: Dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            if key in data and data[key] is not None:
+                return data[key]
+        return None
+
+    @classmethod
+    def profile_url(cls, did: str, handle: str = "") -> str:
+        actor = cls._as_string(handle).strip() or cls._as_string(did).strip()
+        return f"https://bsky.app/profile/{actor}" if actor else ""
+
+    @staticmethod
     def _to_snake_case(key: str) -> str:
         if not isinstance(key, str) or not key or key.startswith("$"):
             return key
@@ -291,12 +323,15 @@ class BlueskyClient:
         return dict(obj)
 
     def get_account(self, actor: str) -> Optional[Dict[str, Any]]:
-        try:
-            clean_actor = self.normalize_actor(actor)
-            profile = self.client.get_profile(actor=clean_actor)
-            return self._to_dict(profile)
-        except Exception:
-            return None
+        clean_actor = self.normalize_actor(actor)
+        for attempt in range(3):
+            try:
+                profile = self.client.get_profile(actor=clean_actor)
+                return self._to_dict(profile)
+            except Exception:
+                if attempt < 2:
+                    time.sleep(0.4 * (attempt + 1))
+        return None
 
     def get_author_feed(self, actor: str, cursor: Optional[str] = None, limit: int = 100) -> Dict[str, Any]:
         try:
@@ -317,22 +352,75 @@ class BlueskyClient:
         except Exception:
             return {}
 
-    def get_social_graph(self, actor: str, limit: int = 100) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    def get_social_graph(
+            self,
+            actor: str,
+            limit: int = 100,
+            max_follows: int = 0,
+            max_followers: int = 0,
+            enrich_profiles: bool = True,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         clean_actor = self.normalize_actor(actor)
-        follows = self._paginate_people(clean_actor, "get_follows", "follows", limit=limit)
-        followers = self._paginate_people(clean_actor, "get_followers", "followers", limit=limit)
+        follows = self._paginate_people(
+            clean_actor,
+            "get_follows",
+            "follows",
+            limit=limit,
+            max_items=max_follows,
+            enrich_profiles=enrich_profiles,
+        )
+        followers = self._paginate_people(
+            clean_actor,
+            "get_followers",
+            "followers",
+            limit=limit,
+            max_items=max_followers,
+            enrich_profiles=enrich_profiles,
+        )
         return follows, followers
 
-    def get_followers_graph(self, actor: str, limit: int = 100) -> List[Dict[str, Any]]:
+    def get_followers_graph(
+            self,
+            actor: str,
+            limit: int = 100,
+            max_items: int = 0,
+            enrich_profiles: bool = True,
+    ) -> List[Dict[str, Any]]:
         clean_actor = self.normalize_actor(actor)
-        return self._paginate_people(clean_actor, "get_followers", "followers", limit=limit)
+        return self._paginate_people(
+            clean_actor,
+            "get_followers",
+            "followers",
+            limit=limit,
+            max_items=max_items,
+            enrich_profiles=enrich_profiles,
+        )
+
+    def get_follows_graph(
+            self,
+            actor: str,
+            limit: int = 100,
+            max_items: int = 0,
+            enrich_profiles: bool = True,
+    ) -> List[Dict[str, Any]]:
+        clean_actor = self.normalize_actor(actor)
+        return self._paginate_people(
+            clean_actor,
+            "get_follows",
+            "follows",
+            limit=limit,
+            max_items=max_items,
+            enrich_profiles=enrich_profiles,
+        )
 
     def _paginate_people(
-        self,
-        actor: str,
-        method_name: str,
-        field_name: str,
-        limit: int = 100,
+            self,
+            actor: str,
+            method_name: str,
+            field_name: str,
+            limit: int = 100,
+            max_items: int = 0,
+            enrich_profiles: bool = True,
     ) -> List[Dict[str, Any]]:
         cursor = None
         items: List[Dict[str, Any]] = []
@@ -343,17 +431,53 @@ class BlueskyClient:
             response = self._to_dict(method(actor=actor, cursor=cursor, limit=limit))
             for person in response.get(field_name, []):
                 p = self._to_dict(person)
-                did = p.get("did")
+                did = self._normalize_account_id(p.get("did"))
                 if not did or did in seen:
                     continue
                 seen.add(did)
+                profile = p
+                if enrich_profiles:
+                    lookup_actor = self._as_string(self._pick_first(p, "handle", "did")) or did
+                    detailed = self.get_account(lookup_actor)
+                    if not detailed and lookup_actor != did:
+                        detailed = self.get_account(did)
+                    if detailed:
+                        profile = {**p, **detailed}
+                handle = self._as_string(profile.get("handle"))
+                description = self._as_string(self._pick_first(profile, "description", "desc", "bio"))
+                avatar_url = self._as_string(self._pick_first(profile, "avatar_url", "avatar"))
+                banner_url = self._as_string(self._pick_first(profile, "banner_url", "banner"))
                 items.append(
                     {
                         "did": did,
-                        "handle": p.get("handle", ""),
-                        "display_name": p.get("display_name", p.get("displayName", "")),
+                        "handle": handle,
+                        "display_name": self._as_string(self._pick_first(profile, "display_name", "displayName")),
+                        "description": description,
+                        "bio": description,
+                        "followers_count": self._pick_first(
+                            profile, "followers_count", "followersCount", "follower_count", "followers"
+                        ),
+                        "following_count": self._pick_first(
+                            profile,
+                            "following_count",
+                            "followingCount",
+                            "follows_count",
+                            "followsCount",
+                            "follows",
+                            "following",
+                        ),
+                        "posts_count": self._pick_first(profile, "posts_count", "postsCount", "posts"),
+                        "created_at": self._as_string(self._pick_first(profile, "created_at", "indexed_at")),
+                        "avatar_url": avatar_url,
+                        "avatar": avatar_url,
+                        "banner_url": banner_url,
+                        "banner": banner_url,
+                        "profile_url": self.profile_url(did=did, handle=handle),
+                        "url": self.profile_url(did=did, handle=handle),
                     }
                 )
+                if max_items > 0 and len(items) >= max_items:
+                    return items
             cursor = response.get("cursor")
             if not cursor:
                 break
@@ -424,6 +548,13 @@ class DataParser:
     def as_string(value: Any) -> str:
         return value if isinstance(value, str) else ""
 
+    @staticmethod
+    def normalize_account_id(value: Any) -> str:
+        text = DataParser.as_string(value).strip()
+        if not text or text == "0" or text.isdigit():
+            return ""
+        return text
+
 
 # =============================================================================
 # GRAPH LOADER
@@ -454,6 +585,11 @@ class GraphLoader:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _profile_url(did: str, handle: str = "") -> str:
+        actor = DataParser.as_string(handle).strip() or DataParser.as_string(did).strip()
+        return f"https://bsky.app/profile/{actor}" if actor else ""
+
     def _copy_parts_to_post(self, session, source_post_id: str, target_post_id: str):
         """Copy all :part relations from one post to another."""
         session.run(
@@ -470,13 +606,30 @@ class GraphLoader:
         created_at = account.get("created_at") or account.get("indexed_at")
         created_at = DataParser.parse_iso_datetime(created_at)
         created_at_iso = (created_at or datetime.datetime.utcnow()).isoformat()
+        did = DataParser.normalize_account_id(account.get("did"))
+        if not did:
+            return False
+        handle = DataParser.as_string(account.get("handle"))
         display_name = DataParser.as_string(self._pick_first(account, "display_name", "displayName"))
-        description = DataParser.as_string(self._pick_first(account, "description", "desc"))
-        followers_count = self._to_int_or_none(self._pick_first(account, "followers_count", "followersCount"))
-        following_count = self._to_int_or_none(
-            self._pick_first(account, "following_count", "follows_count", "followsCount")
+        description = DataParser.as_string(self._pick_first(account, "description", "desc", "bio"))
+        avatar_url = DataParser.as_string(self._pick_first(account, "avatar_url", "avatar"))
+        banner_url = DataParser.as_string(self._pick_first(account, "banner_url", "banner"))
+        profile_url = self._profile_url(did=did, handle=handle)
+        followers_count = self._to_int_or_none(
+            self._pick_first(account, "followers_count", "followersCount", "follower_count", "followers")
         )
-        posts_count = self._to_int_or_none(self._pick_first(account, "posts_count", "postsCount"))
+        following_count = self._to_int_or_none(
+            self._pick_first(
+                account,
+                "following_count",
+                "followingCount",
+                "follows_count",
+                "followsCount",
+                "follows",
+                "following",
+            )
+        )
+        posts_count = self._to_int_or_none(self._pick_first(account, "posts_count", "postsCount", "posts"))
 
         query = """
         MERGE (a:BlueSky_Account {id: $id})
@@ -487,6 +640,11 @@ class GraphLoader:
             a.description = $description,
             a.descr = $description,
             a.url = $url,
+            a.profile_url = $profile_url,
+            a.avatar_url = $avatar_url,
+            a.avatar = $avatar_url,
+            a.banner_url = $banner_url,
+            a.banner = $banner_url,
             a.created_at = datetime($created_at),
             a.followers_count = coalesce($followers_count, 0),
             a.following_count = coalesce($following_count, 0),
@@ -500,6 +658,11 @@ class GraphLoader:
             a.description = CASE WHEN $description <> '' THEN $description ELSE a.description END,
             a.descr = CASE WHEN $description <> '' THEN $description ELSE a.descr END,
             a.url = CASE WHEN $url <> '' THEN $url ELSE a.url END,
+            a.profile_url = CASE WHEN $profile_url <> '' THEN $profile_url ELSE a.profile_url END,
+            a.avatar_url = CASE WHEN $avatar_url <> '' THEN $avatar_url ELSE a.avatar_url END,
+            a.avatar = CASE WHEN $avatar_url <> '' THEN $avatar_url ELSE a.avatar END,
+            a.banner_url = CASE WHEN $banner_url <> '' THEN $banner_url ELSE a.banner_url END,
+            a.banner = CASE WHEN $banner_url <> '' THEN $banner_url ELSE a.banner END,
             a.followers_count = CASE WHEN $followers_count IS NOT NULL THEN $followers_count ELSE a.followers_count END,
             a.following_count = CASE WHEN $following_count IS NOT NULL THEN $following_count ELSE a.following_count END,
             a.follows_count = CASE WHEN $following_count IS NOT NULL THEN $following_count ELSE a.follows_count END,
@@ -508,11 +671,14 @@ class GraphLoader:
             a.dateM = datetime()
         """
         params = {
-            "id": account.get("did"),
-            "handle": DataParser.as_string(account.get("handle")),
+            "id": did,
+            "handle": handle,
             "display_name": display_name,
             "description": description,
-            "url": f"https://bsky.app/profile/{account.get('did')}",
+            "url": profile_url,
+            "profile_url": profile_url,
+            "avatar_url": avatar_url,
+            "banner_url": banner_url,
             "created_at": created_at_iso,
             "followers_count": followers_count,
             "following_count": following_count,
@@ -546,25 +712,104 @@ class GraphLoader:
             session.run(query, {"id": account_id, "last_post_uri": last_post_uri})
 
     def _merge_account_stub(self, session, did: str):
+        did = DataParser.normalize_account_id(did)
+        if not did:
+            return
+        profile_url = self._profile_url(did=did)
         query = """
         MERGE (a:BlueSky_Account {id: $did})
-        ON CREATE SET a.dateC = datetime(), a.handle = $did, a.display_name = '', a.last_post_uri = ''
+        ON CREATE SET
+            a.dateC = datetime(),
+            a.handle = $did,
+            a.display_name = '',
+            a.description = '',
+            a.descr = '',
+            a.url = $url,
+            a.profile_url = $profile_url,
+            a.avatar_url = '',
+            a.avatar = '',
+            a.banner_url = '',
+            a.banner = '',
+            a.created_at = datetime(),
+            a.followers_count = 0,
+            a.following_count = 0,
+            a.follows_count = 0,
+            a.posts_count = 0,
+            a.prior = 0,
+            a.last_post_uri = ''
+        ON MATCH SET
+            a.url = CASE WHEN $url <> '' THEN $url ELSE a.url END,
+            a.profile_url = CASE WHEN $profile_url <> '' THEN $profile_url ELSE a.profile_url END,
+            a.dateM = datetime()
         """
-        session.run(query, {"did": did})
+        session.run(query, {"did": did, "url": profile_url, "profile_url": profile_url})
 
-    def _merge_account_meta(self, session, did: str, handle: str = "", display_name: str = ""):
+    def _merge_account_meta(self, session, profile: Dict[str, Any]):
+        did = DataParser.normalize_account_id(profile.get("did"))
+        if not did:
+            return
+
+        handle = DataParser.as_string(profile.get("handle"))
+        display_name = DataParser.as_string(profile.get("display_name", profile.get("displayName", "")))
+        description = DataParser.as_string(self._pick_first(profile, "description", "desc", "bio"))
+        avatar_url = DataParser.as_string(self._pick_first(profile, "avatar_url", "avatar"))
+        banner_url = DataParser.as_string(self._pick_first(profile, "banner_url", "banner"))
+        profile_url = self._profile_url(did=did, handle=handle)
+        followers_count = self._to_int_or_none(
+            self._pick_first(profile, "followers_count", "followersCount", "follower_count", "followers")
+        )
+        following_count = self._to_int_or_none(
+            self._pick_first(
+                profile,
+                "following_count",
+                "followingCount",
+                "follows_count",
+                "followsCount",
+                "follows",
+                "following",
+            )
+        )
+        posts_count = self._to_int_or_none(self._pick_first(profile, "posts_count", "postsCount", "posts"))
+        created_at_value = profile.get("created_at", profile.get("indexed_at"))
+        created_at = DataParser.parse_iso_datetime(created_at_value)
+        created_at_iso = (created_at or datetime.datetime.utcnow()).isoformat()
+
         query = """
         MERGE (a:BlueSky_Account {id: $did})
         ON CREATE SET
             a.dateC = datetime(),
             a.handle = CASE WHEN $handle <> '' THEN $handle ELSE $did END,
             a.display_name = $display_name,
+            a.description = $description,
+            a.descr = $description,
             a.url = $url,
+            a.profile_url = $profile_url,
+            a.avatar_url = $avatar_url,
+            a.avatar = $avatar_url,
+            a.banner_url = $banner_url,
+            a.banner = $banner_url,
+            a.created_at = datetime($created_at),
+            a.followers_count = coalesce($followers_count, 0),
+            a.following_count = coalesce($following_count, 0),
+            a.follows_count = coalesce($following_count, 0),
+            a.posts_count = coalesce($posts_count, 0),
+            a.prior = 0,
             a.last_post_uri = ''
         ON MATCH SET
             a.handle = CASE WHEN $handle <> '' THEN $handle ELSE a.handle END,
             a.display_name = CASE WHEN $display_name <> '' THEN $display_name ELSE a.display_name END,
+            a.description = CASE WHEN $description <> '' THEN $description ELSE a.description END,
+            a.descr = CASE WHEN $description <> '' THEN $description ELSE a.descr END,
             a.url = CASE WHEN $url <> '' THEN $url ELSE a.url END,
+            a.profile_url = CASE WHEN $profile_url <> '' THEN $profile_url ELSE a.profile_url END,
+            a.avatar_url = CASE WHEN $avatar_url <> '' THEN $avatar_url ELSE a.avatar_url END,
+            a.avatar = CASE WHEN $avatar_url <> '' THEN $avatar_url ELSE a.avatar END,
+            a.banner_url = CASE WHEN $banner_url <> '' THEN $banner_url ELSE a.banner_url END,
+            a.banner = CASE WHEN $banner_url <> '' THEN $banner_url ELSE a.banner END,
+            a.followers_count = CASE WHEN $followers_count IS NOT NULL THEN $followers_count ELSE a.followers_count END,
+            a.following_count = CASE WHEN $following_count IS NOT NULL THEN $following_count ELSE a.following_count END,
+            a.follows_count = CASE WHEN $following_count IS NOT NULL THEN $following_count ELSE a.follows_count END,
+            a.posts_count = CASE WHEN $posts_count IS NOT NULL THEN $posts_count ELSE a.posts_count END,
             a.dateM = datetime()
         """
         session.run(
@@ -573,7 +818,15 @@ class GraphLoader:
                 "did": did,
                 "handle": handle,
                 "display_name": display_name,
-                "url": f"https://bsky.app/profile/{did}" if did else "",
+                "description": description,
+                "url": profile_url,
+                "profile_url": profile_url,
+                "avatar_url": avatar_url,
+                "banner_url": banner_url,
+                "created_at": created_at_iso,
+                "followers_count": followers_count,
+                "following_count": following_count,
+                "posts_count": posts_count,
             },
         )
 
@@ -585,17 +838,12 @@ class GraphLoader:
                 did = followee.get("did")
                 if not did:
                     continue
-                self._merge_account_meta(
-                    session,
-                    did,
-                    followee.get("handle", ""),
-                    followee.get("display_name", ""),
-                )
+                self._merge_account_meta(session, followee)
                 session.run(
                     """
                     MATCH (src:BlueSky_Account {id: $src_id})
                     MATCH (dst:BlueSky_Account {id: $dst_id})
-                    MERGE (src)-[:FOLLOWS]->(dst)
+                    MERGE (src)-[:FOLLOWING]->(dst)
                     """,
                     {"src_id": account_did, "dst_id": did},
                 )
@@ -604,12 +852,7 @@ class GraphLoader:
                 did = follower.get("did")
                 if not did:
                     continue
-                self._merge_account_meta(
-                    session,
-                    did,
-                    follower.get("handle", ""),
-                    follower.get("display_name", ""),
-                )
+                self._merge_account_meta(session, follower)
                 session.run(
                     """
                     MATCH (src:BlueSky_Account {id: $src_id})
@@ -623,15 +866,15 @@ class GraphLoader:
                 """
                 MATCH (a:BlueSky_Account {id: $account_id})
                 SET
-                    a.following_count = $following_count,
-                    a.follows_count = $following_count,
-                    a.followers_count = $followers_count,
+                    a.following_loaded = $following_loaded,
+                    a.follows_loaded = $following_loaded,
+                    a.followers_loaded = $followers_loaded,
                     a.dateM = datetime()
                 """,
                 {
                     "account_id": account_did,
-                    "following_count": len(follows),
-                    "followers_count": len(followers),
+                    "following_loaded": len(follows),
+                    "followers_loaded": len(followers),
                 },
             )
 
@@ -643,12 +886,7 @@ class GraphLoader:
                 did = follower.get("did")
                 if not did:
                     continue
-                self._merge_account_meta(
-                    session,
-                    did,
-                    follower.get("handle", ""),
-                    follower.get("display_name", ""),
-                )
+                self._merge_account_meta(session, follower)
                 session.run(
                     """
                     MATCH (src:BlueSky_Account {id: $src_id})
@@ -661,15 +899,44 @@ class GraphLoader:
             session.run(
                 """
                 MATCH (a:BlueSky_Account {id: $account_id})
-                SET a.followers_count = $followers_count, a.dateM = datetime()
+                SET a.followers_loaded = $followers_loaded, a.dateM = datetime()
                 """,
-                {"account_id": account_did, "followers_count": len(followers)},
+                {"account_id": account_did, "followers_loaded": len(followers)},
+            )
+
+    def save_follows_graph(self, account_did: str, follows: List[Dict[str, Any]]):
+        with self.db.driver.session() as session:
+            self._merge_account_stub(session, account_did)
+
+            for followee in follows:
+                did = followee.get("did")
+                if not did:
+                    continue
+                self._merge_account_meta(session, followee)
+                session.run(
+                    """
+                    MATCH (src:BlueSky_Account {id: $src_id})
+                    MATCH (dst:BlueSky_Account {id: $dst_id})
+                    MERGE (src)-[:FOLLOWING]->(dst)
+                    """,
+                    {"src_id": account_did, "dst_id": did},
+                )
+
+            session.run(
+                """
+                MATCH (a:BlueSky_Account {id: $account_id})
+                SET
+                    a.following_loaded = $following_loaded,
+                    a.follows_loaded = $following_loaded,
+                    a.dateM = datetime()
+                """,
+                {"account_id": account_did, "following_loaded": len(follows)},
             )
 
     def _extract_commenters_from_thread(
-        self,
-        thread_payload: Dict[str, Any],
-        root_post_id: str,
+            self,
+            thread_payload: Dict[str, Any],
+            root_post_id: str,
     ) -> Tuple[Counter, Dict[str, Dict[str, str]], List[Dict[str, str]]]:
         actor_counts: Counter = Counter()
         actor_meta: Dict[str, Dict[str, str]] = {}
@@ -693,7 +960,7 @@ class GraphLoader:
                 author = post.get("author", {})
                 if not isinstance(author, dict):
                     author = {}
-                did = DataParser.as_string(author.get("did"))
+                did = DataParser.normalize_account_id(author.get("did"))
                 if did and comment_post_id and comment_post_id != root_post_id and comment_post_id not in seen_comment_posts:
                     seen_comment_posts.add(comment_post_id)
                     actor_counts[did] += 1
@@ -742,9 +1009,11 @@ class GraphLoader:
                 meta = actor_meta.get(actor_id, {})
                 self._merge_account_meta(
                     session,
-                    actor_id,
-                    meta.get("handle", ""),
-                    meta.get("display_name", ""),
+                    {
+                        "did": actor_id,
+                        "handle": meta.get("handle", ""),
+                        "display_name": meta.get("display_name", ""),
+                    },
                 )
                 session.run(
                     """
@@ -812,9 +1081,11 @@ class GraphLoader:
         return {
             "id": post.get("uri"),
             "cid": post.get("cid"),
-            "author_id": author.get("did"),
+            "author_id": DataParser.normalize_account_id(author.get("did")),
             "author_handle": author.get("handle", ""),
             "author_display_name": author.get("display_name", author.get("displayName", "")),
+            "author_avatar": author.get("avatar", ""),
+            "author_banner": author.get("banner", ""),
             "created_at": record.get("created_at") or post.get("indexed_at"),
             "indexed_at": post.get("indexed_at"),
             "text": text,
@@ -854,20 +1125,34 @@ class GraphLoader:
                 a.handle = $handle,
                 a.display_name = $display_name,
                 a.url = $url,
+                a.profile_url = $profile_url,
+                a.avatar_url = $avatar_url,
+                a.avatar = $avatar_url,
+                a.banner_url = $banner_url,
+                a.banner = $banner_url,
                 a.last_post_uri = ''
             ON MATCH SET
                 a.handle = CASE WHEN $handle <> '' THEN $handle ELSE a.handle END,
                 a.display_name = CASE WHEN $display_name <> '' THEN $display_name ELSE a.display_name END,
                 a.url = CASE WHEN $url <> '' THEN $url ELSE a.url END,
+                a.profile_url = CASE WHEN $profile_url <> '' THEN $profile_url ELSE a.profile_url END,
+                a.avatar_url = CASE WHEN $avatar_url <> '' THEN $avatar_url ELSE a.avatar_url END,
+                a.avatar = CASE WHEN $avatar_url <> '' THEN $avatar_url ELSE a.avatar END,
+                a.banner_url = CASE WHEN $banner_url <> '' THEN $banner_url ELSE a.banner_url END,
+                a.banner = CASE WHEN $banner_url <> '' THEN $banner_url ELSE a.banner END,
                 a.dateM = datetime()
             """
+            author_profile_url = self._profile_url(did=p["author_id"], handle=p["author_handle"])
             session.run(
                 account_merge,
                 {
                     "id": p["author_id"],
                     "handle": p["author_handle"],
                     "display_name": p["author_display_name"],
-                    "url": f"https://bsky.app/profile/{p['author_id']}",
+                    "url": author_profile_url,
+                    "profile_url": author_profile_url,
+                    "avatar_url": DataParser.as_string(p.get("author_avatar")),
+                    "banner_url": DataParser.as_string(p.get("author_banner")),
                 },
             )
 
@@ -1119,7 +1404,8 @@ class GraphLoader:
                         "id": media_id,
                         "url": uri,
                         "preview": DataParser.as_string(external.get("thumb")),
-                        "description": DataParser.as_string(external.get("title")) or DataParser.as_string(external.get("description")),
+                        "description": DataParser.as_string(external.get("title")) or DataParser.as_string(
+                            external.get("description")),
                         "post_id": post_id,
                     },
                 )
@@ -1184,8 +1470,9 @@ class BlueskyParser:
 
             display_name = account.get("display_name") or account.get("displayName") or ""
             self.log.success(f"Found: {display_name} (@{account.get('handle', '')})")
-            if account.get("did"):
-                resolved_ids.append(account["did"])
+            resolved_did = DataParser.normalize_account_id(account.get("did"))
+            if resolved_did:
+                resolved_ids.append(resolved_did)
             is_created = self.loader.add_account(account, prior)
             if is_created:
                 added_count += 1
@@ -1356,10 +1643,34 @@ class BlueskyParser:
         self.log.data(f"Counters for {account_id}: followers={followers}, following={following}, posts={posts}")
 
     def sync_social_graph_for_account(self, account_id: str):
-        self.log.process(f"Sync followers relations for {account_id}...")
-        followers = self.bluesky.get_followers_graph(account_id)
+        follower_limit = self.config.MAX_FOLLOWERS if self.config.MAX_FOLLOWERS > 0 else 0
+        suffix = f" (limit={follower_limit})" if follower_limit > 0 else ""
+        self.log.process(f"Sync followers relations for {account_id}{suffix}...")
+        account = self.bluesky.get_account(account_id)
+        if account:
+            self.loader.add_account(account, self.config.PRIOR)
+        followers = self.bluesky.get_followers_graph(
+            account_id,
+            max_items=follower_limit,
+            enrich_profiles=self.config.ENRICH_SOCIAL_PROFILES,
+        )
         self.loader.save_followers_graph(account_id, followers)
         self.log.data(f"Followers relations for {account_id}: followers={len(followers)}")
+
+    def sync_follows_graph_for_account(self, account_id: str):
+        follows_limit = self.config.MAX_FOLLOWS if self.config.MAX_FOLLOWS > 0 else 0
+        suffix = f" (limit={follows_limit})" if follows_limit > 0 else ""
+        self.log.process(f"Sync follows relations for {account_id}{suffix}...")
+        account = self.bluesky.get_account(account_id)
+        if account:
+            self.loader.add_account(account, self.config.PRIOR)
+        follows = self.bluesky.get_follows_graph(
+            account_id,
+            max_items=follows_limit,
+            enrich_profiles=self.config.ENRICH_SOCIAL_PROFILES,
+        )
+        self.loader.save_follows_graph(account_id, follows)
+        self.log.data(f"Follows relations for {account_id}: follows={len(follows)}")
 
     def run(self):
         self.log.separator("#")
@@ -1376,8 +1687,11 @@ class BlueskyParser:
         self.log.info(
             f"Settings: max_pages={self.config.MAX_PAGES}, max_posts={self.config.MAX_POSTS}, "
             f"min_date={self.config.MIN_DATE}, prior={self.config.PRIOR}, "
+            f"max_followers={self.config.MAX_FOLLOWERS}, max_follows={self.config.MAX_FOLLOWS}, "
+            f"enrich_social_profiles={self.config.ENRICH_SOCIAL_PROFILES}, "
             f"sync_account_counters={self.config.SYNC_ACCOUNT_COUNTERS}, "
             f"sync_social_graph={self.config.SYNC_SOCIAL_GRAPH}, "
+            f"sync_follows_graph={self.config.SYNC_FOLLOWS_GRAPH}, "
             f"sync_post_commenters={self.config.SYNC_POST_COMMENTERS}, "
             f"comment_thread_depth={self.config.COMMENT_THREAD_DEPTH}"
         )
@@ -1388,6 +1702,14 @@ class BlueskyParser:
         else:
             accounts = self.db.get_accounts_with_prior(prior=self.config.PRIOR)
             self.log.data(f"Accounts found by prior={self.config.PRIOR}: {len(accounts)}")
+        filtered_accounts: List[Dict[str, Any]] = []
+        for account in accounts:
+            normalized_id = DataParser.normalize_account_id(account.get("id"))
+            if not normalized_id:
+                self.log.warning(f"Skip account with invalid id: {account.get('id')}")
+                continue
+            filtered_accounts.append({"id": normalized_id, "last_post_uri": account.get("last_post_uri", "")})
+        accounts = filtered_accounts
         total_accounts = len(accounts)
 
         if self.config.SYNC_ACCOUNT_COUNTERS:
@@ -1405,6 +1727,14 @@ class BlueskyParser:
                     self.sync_social_graph_for_account(account["id"])
                 except Exception as exc:
                     self.log.warning(f"Failed to sync followers relations for {account['id']}: {exc}")
+
+        if self.config.SYNC_FOLLOWS_GRAPH:
+            self.log.info(">>> Step 2.3: Sync follows relations")
+            for account in accounts:
+                try:
+                    self.sync_follows_graph_for_account(account["id"])
+                except Exception as exc:
+                    self.log.warning(f"Failed to sync follows relations for {account['id']}: {exc}")
 
         total_loaded = 0
         for idx, account in enumerate(accounts, 1):
@@ -1467,24 +1797,28 @@ if __name__ == "__main__":
     # Accounts to parse (handle, did, @handle, or bsky profile URL)
     ACCOUNTS_TO_PARSE = [
         "https://bsky.app/profile/jay.bsky.team",
-        "https://bsky.app/profile/atproto.com",
         # "@handle.bsky.social",
         # "did:plc:...",
     ]
-
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!НАСТРОЙКИ !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     # Loading options
     MAX_PAGES = 3
     MAX_POSTS = 0
     MIN_DATE = None
+    MAX_FOLLOWERS = 10  # ЛИМИТЫ!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!0 = без лимита
+    MAX_FOLLOWS = 10  # ЛИМИТЫ!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!0 = без лимита
     PRIOR = 1
     SYNC_ACCOUNT_COUNTERS = True
     SYNC_SOCIAL_GRAPH = False
+    SYNC_FOLLOWS_GRAPH = False
+    ENRICH_SOCIAL_PROFILES = True
     SYNC_POST_COMMENTERS = True
     COMMENT_THREAD_DEPTH = 16
 
-    
-    if 1: #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! ЗАМЕНИТЬ НА 0 и 1 ПРИ НЕОБХОДИМОСТИ, ГДЕ 0 - НЕТ, 1 - ДА!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    if 1:  # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! ЗАМЕНИТЬ НА 0 и 1 ПРИ НЕОБХОДИМОСТИ, ГДЕ 0 - НЕТ, 1 - ДА!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
         SYNC_SOCIAL_GRAPH = True
+    if 1:  # Включить/выключить синхронизацию подписок (кого читает аккаунт)
+        SYNC_FOLLOWS_GRAPH = True
 
     # Example:
     # MIN_DATE = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
@@ -1507,9 +1841,13 @@ if __name__ == "__main__":
         MAX_PAGES=MAX_PAGES,
         MAX_POSTS=MAX_POSTS,
         MIN_DATE=MIN_DATE,
+        MAX_FOLLOWERS=MAX_FOLLOWERS,
+        MAX_FOLLOWS=MAX_FOLLOWS,
         PRIOR=PRIOR,
         SYNC_ACCOUNT_COUNTERS=SYNC_ACCOUNT_COUNTERS,
         SYNC_SOCIAL_GRAPH=SYNC_SOCIAL_GRAPH,
+        SYNC_FOLLOWS_GRAPH=SYNC_FOLLOWS_GRAPH,
+        ENRICH_SOCIAL_PROFILES=ENRICH_SOCIAL_PROFILES,
         SYNC_POST_COMMENTERS=SYNC_POST_COMMENTERS,
         COMMENT_THREAD_DEPTH=COMMENT_THREAD_DEPTH,
     )
